@@ -1,0 +1,470 @@
+
+
+
+
+
+
+# !pip install opencv-python-headless -q
+
+import os
+import glob
+import random
+import warnings
+
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+import seaborn as sns
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import models
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report, confusion_matrix,
+    f1_score, matthews_corrcoef, accuracy_score,
+    precision_score, recall_score
+)
+
+warnings.filterwarnings("ignore")
+sns.set_theme(style="whitegrid")
+plt.rcParams["figure.figsize"] = (10, 5)
+
+RANDOM_STATE = 42
+random.seed(RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+torch.manual_seed(RANDOM_STATE)
+torch.cuda.manual_seed_all(RANDOM_STATE)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
+
+DX_CLASSES = ["akiec", "bcc", "bkl", "df", "mel", "nv", "vasc"]
+CLASS_TO_IDX = {c: i for i, c in enumerate(DX_CLASSES)}
+NUM_CLASSES = len(DX_CLASSES)
+
+
+
+
+
+# ==== TIỀN XỬ LÝ CHÍNH THỨC — set theo kết luận từ notebook trước ====
+USE_CLAHE = True   # đổi thành False nếu Experiment A (No-CLAHE) cho kết quả tốt hơn
+
+IMG_SIZE = 224
+BATCH_SIZE = 64        # giảm so với 128 vì ResNet nặng hơn SkinCNN, tránh tràn VRAM
+EPOCHS = 10             # 9 experiment liên tiếp -> giảm epoch, tăng lại khi chốt cấu hình cuối cùng
+LR = 1e-4               # nhỏ hơn 1e-3 dùng ở SkinCNN vì fine-tune pretrained cần lr thấp hơn
+
+print(f"Tiền xử lý chính thức: {'CLAHE' if USE_CLAHE else 'Raw (No-CLAHE)'}")
+
+
+
+
+
+def get_data_dir():
+    kaggle_path = "/kaggle/input/datasets/kmader/skin-cancer-mnist-ham10000"
+    local_path = "data"
+    if os.path.isdir(kaggle_path):
+        print("Đang chạy trên Kaggle")
+        return kaggle_path
+    print("Đang chạy local")
+    return local_path
+
+DATA_DIR = get_data_dir()
+METADATA_PATH = os.path.join(DATA_DIR, "/kaggle/input/datasets/kmader/skin-cancer-mnist-ham10000/HAM10000_metadata.csv")
+IMAGE_DIRS = [
+    os.path.join(DATA_DIR, "/kaggle/input/datasets/kmader/skin-cancer-mnist-ham10000/HAM10000_images_part_1"),
+    os.path.join(DATA_DIR, "/kaggle/input/datasets/kmader/skin-cancer-mnist-ham10000/HAM10000_images_part_2"),
+]
+
+image_path_map = {}
+for d in IMAGE_DIRS:
+    if os.path.isdir(d):
+        for f in glob.glob(os.path.join(d, "*.jpg")):
+            image_id = os.path.splitext(os.path.basename(f))[0]
+            image_path_map[image_id] = f
+
+print(f"Tổng số ảnh tìm thấy: {len(image_path_map)}")
+
+
+
+
+
+df = pd.read_csv(METADATA_PATH)
+df["image_path"] = df["image_id"].map(image_path_map)
+
+df = df[df["image_path"].notna()].reset_index(drop=True)
+df = df.drop_duplicates(subset=["image_id"]).reset_index(drop=True)
+
+age_median = df["age"].median()
+df["age"] = df["age"].fillna(age_median)
+
+df["label"] = df["dx"].map(CLASS_TO_IDX)
+df = df[df["label"].notna()].reset_index(drop=True)
+df["label"] = df["label"].astype(int)
+
+print("Shape sau khi làm sạch:", df.shape)
+
+
+
+
+
+lesion_df = df.groupby("lesion_id").first().reset_index()[["lesion_id", "label"]]
+
+train_lesions, temp_lesions = train_test_split(
+    lesion_df, test_size=0.3, stratify=lesion_df["label"], random_state=RANDOM_STATE
+)
+val_lesions, test_lesions = train_test_split(
+    temp_lesions, test_size=0.5, stratify=temp_lesions["label"], random_state=RANDOM_STATE
+)
+
+train_df = df[df["lesion_id"].isin(train_lesions["lesion_id"])].reset_index(drop=True)
+val_df = df[df["lesion_id"].isin(val_lesions["lesion_id"])].reset_index(drop=True)
+test_df = df[df["lesion_id"].isin(test_lesions["lesion_id"])].reset_index(drop=True)
+
+print(f"Train: {len(train_df)} ảnh | Val: {len(val_df)} ảnh | Test: {len(test_df)} ảnh")
+
+
+
+
+
+import albumentations as A
+
+def apply_clahe_rgb(img_array, clip_limit=2.0, tile_grid_size=(8, 8)):
+    lab = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
+    l_clahe = clahe.apply(l)
+    lab_clahe = cv2.merge((l_clahe, a, b))
+    return cv2.cvtColor(lab_clahe, cv2.COLOR_LAB2RGB)
+
+
+def get_train_augmentation():
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.5),
+        A.Rotate(limit=30, p=0.7),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=15, p=0.5),
+    ])
+
+augment_pipeline = get_train_augmentation()
+
+# Chuẩn hóa theo ImageNet — bắt buộc vì dùng pretrained weights ImageNet
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
+IMAGENET_STD = np.array([0.229, 0.224, 0.225])
+
+
+class SkinDataset(Dataset):
+    def __init__(self, df, img_size=IMG_SIZE, augment=None, use_clahe=USE_CLAHE):
+        self.paths = df["image_path"].values
+        self.labels = df["label"].values
+        self.img_size = (img_size, img_size)
+        self.augment = augment
+        self.use_clahe = use_clahe
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert("RGB")
+        img = img.resize(self.img_size, Image.BILINEAR)
+        arr = np.array(img)
+
+        if self.use_clahe:
+            arr = apply_clahe_rgb(arr)
+
+        if self.augment is not None:
+            arr = self.augment(image=arr)["image"]
+
+        arr = arr.astype(np.float32) / 255.0
+        arr = (arr - IMAGENET_MEAN) / IMAGENET_STD   # chuẩn hóa ImageNet — khác SkinCNN trước (chỉ chia 255)
+        tensor = torch.tensor(arr, dtype=torch.float32).permute(2, 0, 1)
+        return tensor, int(self.labels[idx])
+
+
+train_ds = SkinDataset(train_df, augment=augment_pipeline)
+val_ds   = SkinDataset(val_df, augment=None)
+test_ds  = SkinDataset(test_df, augment=None)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+
+print(f"Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+
+
+
+
+
+RESNET_VARIANTS = {
+    "ResNet18": (models.resnet18, models.ResNet18_Weights.DEFAULT),
+    "ResNet34": (models.resnet34, models.ResNet34_Weights.DEFAULT),
+    "ResNet50": (models.resnet50, models.ResNet50_Weights.DEFAULT),
+}
+
+FREEZE_STRATEGIES = ["frozen", "partial", "full"]
+
+
+def build_resnet(variant_name, freeze_strategy, num_classes=NUM_CLASSES, seed=RANDOM_STATE):
+    """
+    freeze_strategy:
+      - 'frozen'  : đóng băng toàn bộ backbone, chỉ train FC mới thêm vào
+      - 'partial' : mở khóa layer3 + layer4 + FC, đóng băng phần đầu (conv1, bn1, layer1, layer2)
+      - 'full'    : mở khóa toàn bộ mạng, fine-tune từ đầu đến cuối
+    """
+    torch.manual_seed(seed)  # đảm bảo lớp FC mới khởi tạo giống nhau giữa các experiment
+
+    model_fn, weights = RESNET_VARIANTS[variant_name]
+    model = model_fn(weights=weights)
+
+    # Thay lớp FC cuối cho đúng số lớp bài toán (7 lớp)
+    in_features = model.fc.in_features
+    model.fc = nn.Sequential(
+        nn.Dropout(0.4),
+        nn.Linear(in_features, num_classes),
+    )
+
+    # --- Áp dụng freeze strategy ---
+    if freeze_strategy == "frozen":
+        for name, param in model.named_parameters():
+            param.requires_grad = "fc" in name
+
+    elif freeze_strategy == "partial":
+        for name, param in model.named_parameters():
+            param.requires_grad = any(k in name for k in ["layer3", "layer4", "fc"])
+
+    elif freeze_strategy == "full":
+        for param in model.parameters():
+            param.requires_grad = True
+
+    else:
+        raise ValueError(f"Freeze strategy không hợp lệ: {freeze_strategy}")
+
+    model = model.to(DEVICE)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"[{variant_name} | {freeze_strategy}] Trainable params: {trainable:,} / {total:,} "
+          f"({trainable/total*100:.1f}%)")
+
+    return model
+
+
+
+
+
+def compute_class_weights(train_ds, num_classes=NUM_CLASSES, method="sqrt"):
+    labels_all = torch.tensor(train_ds.labels.astype(int))
+    counts_t = torch.bincount(labels_all, minlength=num_classes).float()
+    weights = 1.0 / torch.sqrt(counts_t) if method == "sqrt" else 1.0 / counts_t
+    weights = weights / weights.sum() * num_classes
+    return weights
+
+
+def train_model(model, train_loader, val_loader, class_weights, epochs=EPOCHS, lr=LR, exp_name=""):
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(DEVICE))
+    # chỉ optimize những tham số có requires_grad=True (đúng theo freeze strategy)
+    optimizer = optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-4
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    hist = {k: [] for k in ["tl", "ta", "vl", "va"]}
+
+    for ep in range(epochs):
+        model.train()
+        loss_sum, correct, total = 0.0, 0, 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item() * len(xb)
+            correct += (out.argmax(1) == yb).sum().item()
+            total += len(xb)
+        scheduler.step()
+
+        model.eval()
+        v_loss_sum, v_correct, v_total = 0.0, 0, 0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+                out = model(xb)
+                loss = criterion(out, yb)
+                v_loss_sum += loss.item() * len(xb)
+                v_correct += (out.argmax(1) == yb).sum().item()
+                v_total += len(xb)
+
+        hist["tl"].append(loss_sum / total)
+        hist["ta"].append(correct / total)
+        hist["vl"].append(v_loss_sum / v_total)
+        hist["va"].append(v_correct / v_total)
+
+        print(f"[{exp_name}] Epoch {ep+1:2d}/{epochs} | "
+              f"Loss: {loss_sum/total:.4f}/{v_loss_sum/v_total:.4f} | "
+              f"Acc: {correct/total:.4f}/{v_correct/v_total:.4f}")
+
+    return hist
+
+
+def evaluate_model(model, test_loader, exp_name=""):
+    model.eval()
+    all_logits, all_labels = [], []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(DEVICE)
+            out = model(xb)
+            all_logits.append(out.cpu())
+            all_labels.append(yb)
+
+    logits = torch.cat(all_logits)
+    y_true = torch.cat(all_labels).numpy()
+    y_pred = logits.argmax(1).numpy()
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+    mcc = matthews_corrcoef(y_true, y_pred)
+
+    print(f"[{exp_name}] Acc={acc:.4f} | Precision={prec:.4f} | Recall={rec:.4f} | "
+          f"F1={f1:.4f} | MCC={mcc:.4f}")
+
+    return {
+        "accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "mcc": mcc,
+        "y_true": y_true, "y_pred": y_pred,
+    }
+
+
+
+
+
+class_weights = compute_class_weights(train_ds)
+
+all_results = []
+all_histories = {}
+
+for variant_name in RESNET_VARIANTS:
+    for freeze_strategy in FREEZE_STRATEGIES:
+        exp_name = f"{variant_name}_{freeze_strategy}"
+        print(f"\n{'='*25} {exp_name} {'='*25}")
+
+        model = build_resnet(variant_name, freeze_strategy)
+        hist = train_model(model, train_loader, val_loader, class_weights, exp_name=exp_name)
+        result = evaluate_model(model, test_loader, exp_name=exp_name)
+
+        result.update({"model": variant_name, "freeze": freeze_strategy})
+        all_results.append(result)
+        all_histories[exp_name] = hist
+
+        # Giải phóng bộ nhớ GPU giữa các experiment
+        del model
+        torch.cuda.empty_cache()
+
+
+sample_paths = df["image_path"].dropna().sample(min(200, len(df)), random_state=RANDOM_STATE)
+sizes = set()
+for p in sample_paths:
+    with Image.open(p) as im:
+        sizes.add(im.size)
+print("Kích thước ảnh gốc (mẫu 200 ảnh):", sizes)
+
+
+
+
+
+results_df = pd.DataFrame(all_results)[
+    ["model", "freeze", "accuracy", "precision", "recall", "f1", "mcc"]
+].round(4)
+results_df = results_df.sort_values(["model", "freeze"]).reset_index(drop=True)
+print(results_df.to_string(index=False))
+
+os.makedirs("experiments", exist_ok=True)
+results_df.to_csv("experiments/resnet_freeze_comparison.csv", index=False)
+
+
+# Heatmap: Accuracy theo kiến trúc x freeze strategy — trực quan cho slide báo cáo
+pivot_acc = results_df.pivot(index="model", columns="freeze", values="accuracy")
+pivot_acc = pivot_acc[["frozen", "partial", "full"]]  # sắp xếp đúng thứ tự logic
+
+plt.figure(figsize=(7, 5))
+sns.heatmap(pivot_acc, annot=True, fmt=".3f", cmap="YlGnBu", vmin=0, vmax=1)
+plt.title("Accuracy: Kiến trúc × Freeze Strategy")
+plt.tight_layout()
+plt.show()
+
+
+# Grouped bar chart: so sánh Macro F1 giữa 3 kiến trúc theo từng freeze strategy
+fig, ax = plt.subplots(figsize=(11, 6))
+x = np.arange(len(RESNET_VARIANTS))
+width = 0.25
+
+for i, strategy in enumerate(FREEZE_STRATEGIES):
+    vals = [results_df[(results_df["model"] == m) & (results_df["freeze"] == strategy)]["f1"].values[0]
+            for m in RESNET_VARIANTS]
+    ax.bar(x + (i - 1) * width, vals, width, label=strategy)
+
+ax.set_xticks(x); ax.set_xticklabels(list(RESNET_VARIANTS.keys()))
+ax.set_ylabel("Macro F1-score")
+ax.set_ylim(0, 1)
+ax.set_title("So sánh Macro F1: Kiến trúc × Freeze Strategy")
+ax.legend(title="Freeze Strategy")
+plt.tight_layout()
+plt.show()
+
+
+# Training curves của tất cả 9 experiment — xem tốc độ hội tụ khác nhau thế nào
+fig, axes = plt.subplots(3, 3, figsize=(16, 12), sharex=True, sharey=True)
+
+for i, variant_name in enumerate(RESNET_VARIANTS):
+    for j, freeze_strategy in enumerate(FREEZE_STRATEGIES):
+        exp_name = f"{variant_name}_{freeze_strategy}"
+        hist = all_histories[exp_name]
+        ax = axes[i, j]
+        ax.plot(hist["ta"], label="Train")
+        ax.plot(hist["va"], label="Val")
+        ax.set_title(exp_name, fontsize=9)
+        if i == 2: ax.set_xlabel("Epoch")
+        if j == 0: ax.set_ylabel("Accuracy")
+
+axes[0, 0].legend(fontsize=8)
+plt.suptitle("Training Curves — 9 Experiment (ResNet18/34/50 × Frozen/Partial/Full)", y=1.01)
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+best_idx = results_df["f1"].idxmax()
+best_row = results_df.loc[best_idx]
+best_result = next(r for r in all_results
+                    if r["model"] == best_row["model"] and r["freeze"] == best_row["freeze"])
+
+print(f"Model tốt nhất: {best_row['model']} — {best_row['freeze']} "
+      f"(Macro F1 = {best_row['f1']:.4f})")
+
+cm = confusion_matrix(best_result["y_true"], best_result["y_pred"])
+cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+plt.figure(figsize=(7, 6))
+sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="RdYlGn",
+            xticklabels=DX_CLASSES, yticklabels=DX_CLASSES, vmin=0, vmax=1)
+plt.title(f"Confusion Matrix (normalized) — {best_row['model']} {best_row['freeze']}")
+plt.xlabel("Predicted"); plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+
