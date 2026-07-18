@@ -28,9 +28,7 @@ https://www.kaggle.com/datasets/kmader/skin-cancer-mnist-ham10000/data
 - Cấu trúc thư mục sau khi tải:
   data/
   ├── HAM10000_metadata.csv
-  |
   ├── HAM10000_images_part_1/
-  |
   └── HAM10000_images_part_2/
 
 ### 3. Mục tiêu giai đoạn EDA
